@@ -504,7 +504,7 @@ void setup() {
   delay(500);
 
   Serial.println();
-  Serial.println(F("=== Barrique ESP32-C3 v1.0.6 — WiFiManager + OTA + Config + (DeepSleep prêt) ==="));
+  Serial.println(F("=== Barrique ESP32-C3 — WiFiManager + OTA + Config + (DeepSleep prêt) ==="));
 
   deviceId = makeDeviceId9Digits();
   Serial.print(F("[ID] Device ID = "));
