@@ -1,66 +1,78 @@
 /*
- * Firmware ESP32-C3 — Capteur barrique — v1.0.3
- * WiFiManager + OTA HTTP (version.json) + config serveur (interval + maintenance)
+ * Firmware ESP32-C3 — Capteur barrique — v1.0.6
  *
- * - WiFi configurable via portail AP "Barrique-XXXXXXXXX"
- * - Reconnexion auto au Wi-Fi connu à chaque démarrage
- * - Retry périodique si le Wi-Fi tombe
- * - OTA HTTP en lisant:
- *     https://prod.lamothe-despujols.com/barriques/firmware/version.json
- *   qui contient:
- *     { "version": "1.0.3", "url": "https://.../firmware.bin" }
- * - Récupération de la config:
- *     https://prod.lamothe-despujols.com/barriques/get_config.php?id=DEVICE_ID
- *   qui renvoie par ex.:
- *     { "measure_interval_sec": 604800, "maintenance": false }
- * - Envoi périodique des mesures brutes ADC vers:
- *     https://prod.lamothe-despujols.com/barriques/api_post.php
- *
- * Pour l’instant : PAS de deep-sleep.
- * Plus tard : on utilisera measureIntervalMs + maintenanceMode pour gérer le sommeil.
+ * - WiFiManager (pas de SSID/MdP en dur)
+ * - Lecture ADC (capteur niveau barrique)
+ * - Envoi JSON HTTPS vers api_post.php
+ * - Récupération config serveur (measure_interval_s, maintenance)
+ * - OTA HTTP via firmware.json (uniquement si version distante > locale)
+ * - Deep sleep sur intervalle de mesure, MAIS désactivé si maintenance = true
+ *   (pour l’instant, maintenance sera à true par défaut côté serveur).
  */
 
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <time.h>
 #include <WiFiManager.h>   // tzapu / tablatronix
 #include <ArduinoJson.h>
 #include <Update.h>
+#include <time.h>
+#include <esp_sleep.h>
 
 // =============================
-// CONFIG UTILISATEUR
+// CONFIG SERVEUR
 // =============================
+const char* SERVER_HOST   = "prod.lamothe-despujols.com";
+const int   SERVER_PORT   = 443;
 
-// API barriques
-const char* API_URL = "https://prod.lamothe-despujols.com/barriques/api_post.php";
+// API mesure
+const char* API_URL       = "https://prod.lamothe-despujols.com/barriques/api_post.php";
 
-// OTA : JSON de description firmware
-const char* OTA_JSON_URL =
-  "https://prod.lamothe-despujols.com/barriques/firmware/version.json";
+// Config capteur
+const char* CONFIG_PATH   = "/barriques/get_config.php";         // on ajoutera ?id=XXXXXXX
 
-// Config par capteur
-const char* CONFIG_URL =
-  "https://prod.lamothe-despujols.com/barriques/get_config.php";
+// OTA JSON (firmware.json avec { "version": "...", "url": "https://.../firmware.bin" })
+const char* OTA_JSON_PATH = "/barriques/firmware/firmware.json";
 
-#define FW_VERSION "1.0.3"
+// =============================
+// VERSION FIRMWARE
+// =============================
+const char* FIRMWARE_VERSION = "1.0.6";
 
-// Mode test si pas de config : 5 s entre mesures
-#define TEST_INTERVAL_MS 5000
-
-// Pin capteur niveau (ADC)
+// =============================
+// HARDWARE & ADC
+// =============================
 const int   PIN_CAPTEUR = 1;
 const float VREF        = 3.3;
 const int   ADC_MAX     = 4095;
 
 // =============================
-// ID matériel sur 9 chiffres
+// CONFIG MESURE / DEEP SLEEP
 // =============================
-String deviceId;
+
+// Par défaut : 7 jours (en secondes)
+const unsigned long DEFAULT_MEASURE_INTERVAL_S = 7UL * 24UL * 3600UL;
+
+// Intervalle en millisecondes (dérivé de la config serveur)
+unsigned long measureIntervalMs = DEFAULT_MEASURE_INTERVAL_S * 1000UL;
+
+// Mode maintenance : si true → PAS de deep sleep (boucle classique)
+bool maintenanceMode = true;
+
+// Timers
+unsigned long lastMeasureMs   = 0;
+unsigned long lastWifiRetryMs = 0;
+const unsigned long WIFI_RETRY_INTERVAL_MS = 60000UL;   // toutes les 60s
+
+// =============================
+// ID matériel (9 chiffres)
+// =============================
+String deviceId;   // ex: "330989340"
 
 String makeDeviceId9Digits() {
   uint64_t mac = ESP.getEfuseMac();
-  uint32_t low  = (uint32_t)(mac & 0xFFFFFFFFULL);
+  uint32_t low = (uint32_t)(mac & 0xFFFFFFFFULL);
   uint32_t high = (uint32_t)((mac >> 32) & 0xFFFFFFFFULL);
   uint64_t mixed = ((uint64_t)high << 32) ^ low;
   uint32_t id9 = (uint32_t)(mixed % 1000000000ULL);
@@ -86,107 +98,94 @@ uint16_t readAdcAveraged(int pin, int samples = 40) {
 // NTP
 // =============================
 time_t getTimestamp() {
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  static bool configured = false;
+
+  if (!configured) {
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    configured = true;
+  }
 
   for (int i = 0; i < 10; i++) {
     time_t now = time(nullptr);
-    if (now > 1700000000) return now; // ~2023+
+    if (now > 1700000000) return now;
     delay(300);
   }
-  return 0; // Le serveur mettra l’heure si besoin
+  return 0; // le serveur mettra l’heure si besoin
 }
 
 // =============================
-// WiFi — logique "comme les cuves"
+// WiFi via WiFiManager (style cuves)
 // =============================
-
-// Timers / paramètres dynamiques
-unsigned long lastMeasureMs    = 0;
-unsigned long lastWifiRetryMs  = 0;
-
-unsigned long measureIntervalMs = TEST_INTERVAL_MS;  // par défaut
-const unsigned long wifiRetryInterval = 60000UL;     // retry Wi-Fi toutes les 60 s
-
-bool maintenanceMode = false; // lu depuis le serveur (config barrique)
-
-// Initialisation Wi-Fi
-void setupWiFiBarrique() {
-  Serial.println("\n[WIFI] Initialisation...");
-
-  WiFi.persistent(true);
+void setupWiFi() {
+  Serial.println(F("\n[WiFi] Initialisation..."));
   WiFi.mode(WIFI_STA);
-  WiFi.begin();   // utilise les identifiants mémorisés par WiFiManager
+  WiFi.persistent(true);
 
+  // 1) Tentative de reconnexion avec les identifiants déjà connus
+  WiFi.begin();
   int tries = 0;
-  // ~30 s pour tenter de se reconnecter tout seul
-  while (WiFi.status() != WL_CONNECTED && tries < 60) {
+  while (WiFi.status() != WL_CONNECTED && tries < 60) { // ~30s
     delay(500);
-    Serial.print(".");
+    Serial.print('.');
     tries++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[WIFI] Reconnexion Wi-Fi réussie sans portail.");
-    Serial.print("[WIFI] SSID = ");
-    Serial.println(WiFi.SSID());
-    Serial.print("[WIFI] IP   = ");
-    Serial.println(WiFi.localIP());
-    Serial.print("[WIFI] RSSI = ");
-    Serial.println(WiFi.RSSI());
-    return;
+    Serial.println(F("\n[WiFi] Reconnexion OK sans portail."));
+  } else {
+    Serial.println(F("\n[WiFi] Échec de reconnexion automatique, WiFiManager..."));
+
+    WiFiManager wm;
+    wm.setDebugOutput(false);
+    wm.setConfigPortalTimeout(180); // 3 min max
+
+    String apName = "Barrique-" + deviceId;
+    Serial.print(F("[WiFi] AP config = "));
+    Serial.println(apName);
+
+    if (!wm.autoConnect(apName.c_str())) {
+      Serial.println(F("[WiFi] WiFiManager échec ou timeout -> pas de Wi-Fi."));
+    }
   }
 
-  Serial.println("\n[WIFI] Impossible de se reconnecter automatiquement.");
-  Serial.println("[WIFI] Démarrage du portail WiFiManager...");
-
-  WiFiManager wm;
-  wm.setDebugOutput(false);
-  wm.setConfigPortalTimeout(180); // portail actif max 3 minutes
-
-  String apName = "Barrique-" + deviceId;
-  bool res = wm.autoConnect(apName.c_str());
-
-  if (!res) {
-    Serial.println("[WIFI] WiFiManager ECHEC ou timeout → pas de Wi-Fi.");
-  } else {
-    Serial.println("[WIFI] CONNECTE via WiFiManager");
-    Serial.print("[WIFI] SSID = ");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print(F("[WiFi] CONNECTÉ à "));
     Serial.println(WiFi.SSID());
-    Serial.print("[WIFI] IP   = ");
+    Serial.print(F("       IP = "));
     Serial.println(WiFi.localIP());
-    Serial.print("[WIFI] RSSI = ");
+    Serial.print(F("       RSSI = "));
     Serial.println(WiFi.RSSI());
+  } else {
+    Serial.println(F("[WiFi] Toujours pas connecté après WiFiManager."));
   }
 }
 
-// Retry automatique du Wi-Fi si perdu
-void retryWifiIfNeeded() {
+// Retry auto si on perd le Wi-Fi
+void retryWiFiIfNeeded() {
   if (WiFi.status() == WL_CONNECTED) return;
 
   unsigned long now = millis();
-  if (now - lastWifiRetryMs < wifiRetryInterval) return;
-
+  if (now - lastWifiRetryMs < WIFI_RETRY_INTERVAL_MS) return;
   lastWifiRetryMs = now;
-  Serial.println("[WIFI] Non connecté → tentative auto...");
 
+  Serial.println(F("[WiFi] Perdu -> tentative automatique..."));
   WiFi.disconnect(true, true);
   delay(200);
   WiFi.mode(WIFI_STA);
-  WiFi.begin();  // derniers identifiants connus (WiFiManager)
+  WiFi.begin();
 }
 
 // =============================
-// HTTP POST vers API barriques
+// HTTP POST mesures
 // =============================
-bool postMeasurement(String deviceId, uint16_t raw, int rssi, uint16_t batteryMv, time_t ts) {
+bool postMeasurement(uint16_t raw, int rssi, uint16_t batteryMv, time_t ts) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(F("[HTTP] WiFi non connecté"));
+    Serial.println(F("[HTTP] Wi-Fi non connecté, envoi annulé."));
     return false;
   }
 
   WiFiClientSecure client;
-  client.setInsecure(); // Pas de vérification SSL
-
+  client.setInsecure();
   HTTPClient https;
 
   Serial.print(F("[HTTP] POST -> "));
@@ -199,10 +198,9 @@ bool postMeasurement(String deviceId, uint16_t raw, int rssi, uint16_t batteryMv
 
   https.addHeader("Content-Type", "application/json");
 
-  // JSON minimal
   String payload = "{";
   payload += "\"id\":\"" + deviceId + "\",";
-  payload += "\"fw\":\"" + String(FW_VERSION) + "\",";
+  payload += "\"fw\":\"" + String(FIRMWARE_VERSION) + "\",";
   payload += "\"value_raw\":" + String(raw) + ",";
   payload += "\"rssi\":" + String(rssi) + ",";
   payload += "\"battery_mv\":" + String(batteryMv) + ",";
@@ -226,188 +224,151 @@ bool postMeasurement(String deviceId, uint16_t raw, int rssi, uint16_t batteryMv
 }
 
 // =============================
-// CONFIG SERVEUR (interval + maintenance)
+// SEMVER (major.minor.patch) pour OTA
 // =============================
-void checkConfigUpdate() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[CONFIG] Wi-Fi non connecté, skip.");
+void parseSemver(const String& v, int &maj, int &min, int &pat) {
+  maj = min = pat = 0;
+  int p1 = v.indexOf('.');
+  int p2 = (p1 >= 0) ? v.indexOf('.', p1 + 1) : -1;
+
+  if (p1 < 0) {
+    maj = v.toInt();
     return;
   }
+  maj = v.substring(0, p1).toInt();
 
-  HTTPClient https;
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  String url = String(CONFIG_URL) + "?id=" + deviceId;
-  Serial.print("[CONFIG] GET ");
-  Serial.println(url);
-
-  if (!https.begin(client, url)) {
-    Serial.println("[CONFIG] begin() ECHEC");
+  if (p2 < 0) {
+    min = v.substring(p1 + 1).toInt();
     return;
   }
+  min = v.substring(p1 + 1, p2).toInt();
+  pat = v.substring(p2 + 1).toInt();
+}
 
-  int code = https.GET();
-  if (code != HTTP_CODE_OK) {
-    Serial.print("[CONFIG] HTTP code = ");
-    Serial.println(code);
-    https.end();
-    return;
-  }
+// renvoie -1 si a<b, 0 si a==b, 1 si a>b
+int compareSemver(const String& a, const String& b) {
+  int aMaj, aMin, aPat;
+  int bMaj, bMin, bPat;
+  parseSemver(a, aMaj, aMin, aPat);
+  parseSemver(b, bMaj, bMin, bPat);
 
-  String body = https.getString();
-  https.end();
-
-  int start = body.indexOf('{');
-  int end   = body.lastIndexOf('}');
-  if (start < 0 || end <= start) {
-    Serial.println("[CONFIG] JSON introuvable dans la réponse");
-    Serial.println(body);
-    return;
-  }
-
-  String jsonStr = body.substring(start, end + 1);
-  Serial.print("[CONFIG] JSON reçu: ");
-  Serial.println(jsonStr);
-
-  StaticJsonDocument<512> doc;
-  DeserializationError err = deserializeJson(doc, jsonStr);
-  if (err) {
-    Serial.print("[CONFIG] Erreur parse JSON: ");
-    Serial.println(err.c_str());
-    return;
-  }
-
-  long intervalSec = doc["measure_interval_sec"] | 0;
-  bool maint       = doc["maintenance"] | false;
-
-  // Si le serveur n’envoie pas d’intervalle, on garde la valeur actuelle
-  if (intervalSec > 0) {
-    // On borne : min 5 s, max 30 jours
-    if (intervalSec < 5) intervalSec = 5;
-    long maxSec = 30L * 24L * 3600L;
-    if (intervalSec > maxSec) intervalSec = maxSec;
-
-    measureIntervalMs = (unsigned long)intervalSec * 1000UL;
-  }
-
-  maintenanceMode = maint;
-
-  Serial.print("[CONFIG] Interval = ");
-  Serial.print(measureIntervalMs / 1000UL);
-  Serial.print(" s  (");
-  Serial.print(measureIntervalMs / 1000UL / 3600.0);
-  Serial.println(" h)");
-
-  Serial.print("[CONFIG] Maintenance = ");
-  Serial.println(maintenanceMode ? "true" : "false");
+  if (aMaj != bMaj) return (aMaj < bMaj) ? -1 : 1;
+  if (aMin != bMin) return (aMin < bMin) ? -1 : 1;
+  if (aPat != bPat) return (aPat < bPat) ? -1 : 1;
+  return 0;
 }
 
 // =============================
-// OTA HTTP via version.json
+// OTA via firmware.json
 // =============================
 void checkForOTAUpdate() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[OTA] Wi-Fi non connecté, skip.");
+    Serial.println(F("[OTA] Wi-Fi non connecté, skip."));
     return;
   }
 
-  Serial.println("\n[OTA] Vérification de mise à jour...");
+  Serial.println(F("\n[OTA] Vérification de mise à jour..."));
 
-  // 1) Récupérer .json
-  HTTPClient https;
+  // 1) Récupérer firmware.json
   WiFiClientSecure client;
   client.setInsecure();
 
-  if (!https.begin(client, OTA_JSON_URL)) {
-    Serial.println("[OTA] Impossible d'initialiser la requête sur firmware.json");
+  if (!client.connect(SERVER_HOST, SERVER_PORT)) {
+    Serial.println(F("[OTA] Connexion HTTPS échouée (firmware.json)"));
     return;
   }
 
-  int code = https.GET();
-  if (code != HTTP_CODE_OK) {
-    Serial.print("[OTA] HTTP code inattendu pour firmware.json: ");
-    Serial.println(code);
-    https.end();
-    return;
+  String path = String(OTA_JSON_PATH);
+  client.println(String("GET ") + path + " HTTP/1.1");
+  client.println(String("Host: ") + SERVER_HOST);
+  client.println("Connection: close");
+  client.println();
+
+  String payload;
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") break;
   }
+  while (client.available()) {
+    payload += client.readString();
+  }
+  client.stop();
 
-  String body = https.getString();
-  https.end();
-
-  int start = body.indexOf('{');
-  int end   = body.lastIndexOf('}');
+  int start = payload.indexOf('{');
+  int end   = payload.lastIndexOf('}');
   if (start < 0 || end <= start) {
-    Serial.println("[OTA] JSON introuvable dans firmware.json");
-    Serial.println(body);
+    Serial.println(F("[OTA] JSON introuvable dans la réponse :"));
+    Serial.println(payload);
     return;
   }
 
-  String jsonStr = body.substring(start, end + 1);
-  Serial.print("[OTA] JSON reçu: ");
+  String jsonStr = payload.substring(start, end + 1);
+  Serial.println(F("[OTA] JSON firmware.json ="));
   Serial.println(jsonStr);
 
   StaticJsonDocument<512> doc;
   DeserializationError err = deserializeJson(doc, jsonStr);
   if (err) {
-    Serial.print("[OTA] Erreur parse JSON: ");
+    Serial.println(F("[OTA] Erreur parse JSON firmware.json"));
     Serial.println(err.c_str());
     return;
   }
 
-  const char* newVersion = doc["version"] | "";
-  String fwUrl           = doc["url"]     | "";
+  String remoteVersion = doc["version"] | "";
+  String fwUrl         = doc["url"]     | "";
 
-  if (strlen(newVersion) == 0 || fwUrl.length() == 0) {
-    Serial.println("[OTA] Champs 'version' ou 'url' manquants.");
+  if (remoteVersion.length() == 0 || fwUrl.length() == 0) {
+    Serial.println(F("[OTA] Champs 'version' ou 'url' manquants"));
     return;
   }
 
-  Serial.print("[OTA] Version distante = ");
-  Serial.println(newVersion);
-  Serial.print("[OTA] Version locale   = ");
-  Serial.println(FW_VERSION);
+  Serial.print(F("[OTA] Version distante = "));
+  Serial.println(remoteVersion);
+  Serial.print(F("[OTA] Version locale   = "));
+  Serial.println(FIRMWARE_VERSION);
 
-  if (String(newVersion) == String(FW_VERSION)) {
-    Serial.println("[OTA] Firmware déjà à jour.");
+  // Comparaison sémantique : on n'update que si remote > locale
+  int cmp = compareSemver(String(FIRMWARE_VERSION), remoteVersion);
+  if (cmp >= 0) {
+    Serial.println(F("[OTA] Firmware déjà à jour ou plus récent, pas d'update."));
     return;
   }
 
-  Serial.println("[OTA] Nouvelle version détectée, lancement mise à jour...");
-  Serial.print("[OTA] URL firmware: ");
+  Serial.println(F("[OTA] Nouvelle version détectée, téléchargement..."));
+  Serial.print(F("[OTA] URL firmware = "));
   Serial.println(fwUrl);
 
-  // 2) Téléchargement et flash
-  HTTPClient fwHttp;
+  // 2) Téléchargement & flash
+  HTTPClient https;
   WiFiClientSecure fwClient;
   fwClient.setInsecure();
 
-  if (!fwHttp.begin(fwClient, fwUrl)) {
-    Serial.println("[OTA] Impossible d'initialiser la requête sur firmware.bin");
+  if (!https.begin(fwClient, fwUrl)) {
+    Serial.println(F("[OTA] https.begin() échoué"));
     return;
   }
 
-  int httpCode = fwHttp.GET();
+  int httpCode = https.GET();
   if (httpCode != HTTP_CODE_OK) {
-    Serial.print("[OTA] Code HTTP inattendu pour firmware.bin: ");
+    Serial.print(F("[OTA] Code HTTP inattendu: "));
     Serial.println(httpCode);
-    fwHttp.end();
+    https.end();
     return;
   }
 
-  int contentLength = fwHttp.getSize();
+  int contentLength = https.getSize();
   if (contentLength <= 0) {
-    Serial.println("[OTA] Taille firmware inconnue ou nulle");
-    fwHttp.end();
+    Serial.println(F("[OTA] Taille firmware invalide"));
+    https.end();
     return;
   }
 
-  WiFiClient* stream = fwHttp.getStreamPtr();
+  WiFiClient *stream = https.getStreamPtr();
   Serial.printf("[OTA] Taille firmware = %d octets\n", contentLength);
 
   if (!Update.begin(contentLength)) {
-    Serial.println("[OTA] Échec Update.begin()");
-    fwHttp.end();
+    Serial.println(F("[OTA] Update.begin() échoué"));
+    https.end();
     return;
   }
 
@@ -415,26 +376,124 @@ void checkForOTAUpdate() {
   if (written != (size_t)contentLength) {
     Serial.printf("[OTA] Écrit %u / %d octets\n", (unsigned)written, contentLength);
     Update.end();
-    fwHttp.end();
+    https.end();
     return;
   }
 
   if (!Update.end()) {
-    Serial.println("[OTA] Update.end() a échoué");
-    fwHttp.end();
+    Serial.println(F("[OTA] Update.end() a échoué"));
+    https.end();
     return;
   }
 
   if (!Update.isFinished()) {
-    Serial.println("[OTA] Mise à jour incomplète");
-    fwHttp.end();
+    Serial.println(F("[OTA] Mise à jour incomplète"));
+    https.end();
     return;
   }
 
-  Serial.println("[OTA] Mise à jour réussie, redémarrage...");
-  fwHttp.end();
+  Serial.println(F("[OTA] Mise à jour réussie, redémarrage..."));
+  https.end();
   delay(500);
   ESP.restart();
+}
+
+// =============================
+// RÉCUPÉRATION CONFIG SERVEUR
+// =============================
+void applyDefaultConfig() {
+  measureIntervalMs = DEFAULT_MEASURE_INTERVAL_S * 1000UL;
+  maintenanceMode   = true; // par défaut → pas de deep sleep
+}
+
+void checkConfigUpdate() {
+  applyDefaultConfig(); // valeurs de base, au cas où
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("[CFG] Wi-Fi non connecté, config par défaut."));
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  String url = String(CONFIG_PATH); // pas d'ID, config globale
+
+  Serial.print(F("[CFG] GET "));
+  Serial.println(url);
+
+  if (!client.connect(SERVER_HOST, SERVER_PORT)) {
+    Serial.println(F("[CFG] Connexion HTTPS échouée"));
+    return;
+  }
+
+  client.println(String("GET ") + url + " HTTP/1.1");
+  client.println(String("Host: ") + SERVER_HOST);
+  client.println("Connection: close");
+  client.println();
+
+  String payload;
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") break;
+  }
+  while (client.available()) {
+    payload += client.readString();
+  }
+  client.stop();
+
+  int start = payload.indexOf('{');
+  int end   = payload.lastIndexOf('}');
+  if (start < 0 || end <= start) {
+    Serial.println(F("[CFG] JSON introuvable dans la réponse"));
+    Serial.println(payload);
+    return;
+  }
+
+  String jsonStr = payload.substring(start, end + 1);
+  Serial.println(F("[CFG] JSON reçu ="));
+  Serial.println(jsonStr);
+
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, jsonStr);
+  if (err) {
+    Serial.println(F("[CFG] Erreur parse JSON config"));
+    Serial.println(err.c_str());
+    return;
+  }
+
+  // measure_interval_s (intervalle de mesure en secondes)
+  unsigned long intervalS = doc["measure_interval_s"] | DEFAULT_MEASURE_INTERVAL_S;
+  if (intervalS == 0) intervalS = DEFAULT_MEASURE_INTERVAL_S;
+  measureIntervalMs = intervalS * 1000UL;
+
+  // maintenance (booléen)
+  maintenanceMode = doc["maintenance"] | true;
+
+  Serial.print(F("[CFG] measure_interval_s = "));
+  Serial.println(intervalS);
+  Serial.print(F("[CFG] maintenance       = "));
+  Serial.println(maintenanceMode ? F("true") : F("false"));
+}
+
+// =============================
+// DEEP SLEEP (armé mais désactivé si maintenance = true)
+// =============================
+void maybeDeepSleep() {
+  if (maintenanceMode) {
+    Serial.println(F("[SLEEP] Maintenance active → pas de deep sleep."));
+    return;
+  }
+
+  // On dort pour la durée de l’intervalle de mesure
+  uint64_t sleepUs = (uint64_t)measureIntervalMs * 1000ULL;
+  Serial.print(F("[SLEEP] Deep sleep pendant (ms) = "));
+  Serial.println(measureIntervalMs);
+
+  esp_sleep_enable_timer_wakeup(sleepUs);
+  Serial.println(F("[SLEEP] Bonne nuit..."));
+  delay(200);
+  esp_deep_sleep_start();
 }
 
 // =============================
@@ -442,10 +501,10 @@ void checkForOTAUpdate() {
 // =============================
 void setup() {
   Serial.begin(115200);
-  delay(800);
+  delay(500);
 
   Serial.println();
-  Serial.println(F("=== Barrique ESP32-C3 v1.0.3 — WiFiManager + OTA + Config ==="));
+  Serial.println(F("=== Barrique ESP32-C3 v1.0.6 — WiFiManager + OTA + Config + (DeepSleep prêt) ==="));
 
   deviceId = makeDeviceId9Digits();
   Serial.print(F("[ID] Device ID = "));
@@ -454,41 +513,32 @@ void setup() {
   analogReadResolution(12);
 
   // Wi-Fi
-  setupWiFiBarrique();
+  setupWiFi();
 
-  // NTP (première sync)
-  getTimestamp();
-
-  // Première récupération de config
+  // Config serveur (measure_interval_s, maintenance)
   checkConfigUpdate();
 
-  // Première vérification OTA au démarrage
+  // Vérif OTA au démarrage
   checkForOTAUpdate();
 
-  // Init timers
-  lastMeasureMs   = millis();
-  lastWifiRetryMs = millis();
+  // Démarre les timers à maintenant
+  unsigned long now = millis();
+  lastMeasureMs   = now;
+  lastWifiRetryMs = now;
 }
 
 // =============================
 // LOOP
 // =============================
 void loop() {
-  retryWifiIfNeeded();
+  retryWiFiIfNeeded();
 
   unsigned long now = millis();
 
-  // Mesures périodiques + config + OTA
   if (now - lastMeasureMs >= measureIntervalMs) {
     lastMeasureMs = now;
 
-    // 1) Récupérer la config (interval + maintenance) depuis le dashboard
-    checkConfigUpdate();
-
-    // 2) Vérifier OTA (nouvelle version ?)
-    checkForOTAUpdate();
-
-    // 3) Lecture ADC
+    // 1) Mesure ADC
     uint16_t raw = readAdcAveraged(PIN_CAPTEUR);
     float v = (raw * VREF) / ADC_MAX;
 
@@ -497,20 +547,25 @@ void loop() {
     Serial.print(F("   V ≈ "));
     Serial.println(v, 3);
 
-    // RSSI
+    // 2) RSSI & batterie (placeholder)
     int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
+    uint16_t batteryMv = 0; // à câbler plus tard
 
-    // Batterie (à câbler plus tard)
-    uint16_t batteryMv = 0;
-
-    // Timestamp
+    // 3) Timestamp
     time_t ts = getTimestamp();
 
-    // 4) POST vers API
-    postMeasurement(deviceId, raw, rssi, batteryMv, ts);
+    // 4) Envoi HTTP
+    postMeasurement(raw, rssi, batteryMv, ts);
 
-    // 🔜 Plus tard : si !maintenanceMode → deep sleep pour measureIntervalMs
+    // 5) Récupérer éventuellement une nouvelle config
+    checkConfigUpdate();
+
+    // 6) Vérifier OTA (synchronisé sur la prise de mesure)
+    checkForOTAUpdate();
+
+    // 7) Deep sleep éventuel (pour l’instant maintenance = true → pas de sleep)
+    maybeDeepSleep();
   }
 
-  // petite respiration, tout le reste utilise déjà des delays
+  delay(50);
 }
