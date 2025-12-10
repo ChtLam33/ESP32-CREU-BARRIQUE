@@ -4,10 +4,14 @@
  * - WiFiManager (pas de SSID/MdP en dur)
  * - Lecture ADC (capteur niveau barrique)
  * - Envoi JSON HTTPS vers api_post.php
- * - Récupération config serveur (measure_interval_s, maintenance)
- * - OTA HTTP via firmware.json (uniquement en mode maintenance ET si version distante > locale)
- * - Deep sleep sur intervalle de mesure si maintenance = false
- *   (maintenance = true => boucle 10 s sans deep sleep, OTA actif)
+ * - Récupération config serveur :
+ *      - measure_interval_s (deep-sleep normal)
+ *      - maintenance (true = mode maintenance 10 s, sans deep sleep)
+ *      - test_20s (true = mode test deep-sleep 20 s)
+ * - OTA HTTP via firmware.json (uniquement en mode maintenance)
+ * - Deep sleep :
+ *      - activé en mode normal & test
+ *      - désactivé en maintenance
  */
 
 #include <Arduino.h>
@@ -30,7 +34,7 @@ const int   SERVER_PORT   = 443;
 const char* API_URL       = "https://prod.lamothe-despujols.com/barriques/api_post.php";
 
 // Config capteur
-const char* CONFIG_PATH   = "/barriques/get_config.php";  // config globale
+const char* CONFIG_PATH   = "/barriques/get_config.php"; // JSON global
 
 // OTA JSON (firmware.json avec { "version": "...", "url": "https://.../firmware.bin" })
 const char* OTA_JSON_PATH = "/barriques/firmware/firmware.json";
@@ -51,17 +55,26 @@ const int   ADC_MAX     = 4095;
 // CONFIG MESURE / DEEP SLEEP
 // =============================
 
-// Par défaut : 7 jours (en secondes)
+// Par défaut : 7 jours (en secondes) pour le mode deep-sleep normal
 const unsigned long DEFAULT_MEASURE_INTERVAL_S = 7UL * 24UL * 3600UL;
 
-// Intervalle en millisecondes (dérivé de la config serveur)
+// Modes fixes
+const unsigned long MAINTENANCE_INTERVAL_MS = 10000UL;  // 10 s
+const unsigned long TEST_INTERVAL_MS        = 20000UL;  // 20 s
+
+// Intervalle en millisecondes (dérivé de la config / du mode)
 unsigned long measureIntervalMs = DEFAULT_MEASURE_INTERVAL_S * 1000UL;
 
-// Mode maintenance : si true → PAS de deep sleep, mesure rapide (10 s) + OTA
+// Mode maintenance : si true → PAS de deep sleep (boucle classique toutes les 10 s)
 bool maintenanceMode = true;
 
+// Mode test deep-sleep 20 s
+bool testMode20s = false;
+
 // Timers
-unsigned long lastMeasureMs = 0;
+unsigned long lastMeasureMs   = 0;
+unsigned long lastWifiRetryMs = 0;
+const unsigned long WIFI_RETRY_INTERVAL_MS = 60000UL;   // toutes les 60s
 
 // =============================
 // ID matériel (9 chiffres)
@@ -112,23 +125,38 @@ time_t getTimestamp() {
 }
 
 // =============================
-// WiFi via WiFiManager
+// WiFi via WiFiManager (ancienne logique + retry)
 // =============================
 void setupWiFi() {
   Serial.println(F("\n[WiFi] Initialisation..."));
   WiFi.mode(WIFI_STA);
   WiFi.persistent(true);
 
-  WiFiManager wm;
-  wm.setDebugOutput(false);
-  wm.setConfigPortalTimeout(180); // 3 min max
+  // 1) Tentative de reconnexion avec les identifiants déjà connus
+  WiFi.begin();
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 60) { // ~30s
+    delay(500);
+    Serial.print('.');
+    tries++;
+  }
 
-  String apName = "Barrique-" + deviceId;
-  Serial.print(F("[WiFi] AP config = "));
-  Serial.println(apName);
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(F("\n[WiFi] Reconnexion OK sans portail."));
+  } else {
+    Serial.println(F("\n[WiFi] Échec de reconnexion automatique, WiFiManager..."));
 
-  if (!wm.autoConnect(apName.c_str())) {
-    Serial.println(F("[WiFi] WiFiManager échec ou timeout -> pas de Wi-Fi."));
+    WiFiManager wm;
+    wm.setDebugOutput(false);
+    wm.setConfigPortalTimeout(180); // 3 min max
+
+    String apName = "Barrique-" + deviceId;
+    Serial.print(F("[WiFi] AP config = "));
+    Serial.println(apName);
+
+    if (!wm.autoConnect(apName.c_str())) {
+      Serial.println(F("[WiFi] WiFiManager échec ou timeout -> pas de Wi-Fi."));
+    }
   }
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -139,8 +167,23 @@ void setupWiFi() {
     Serial.print(F("       RSSI = "));
     Serial.println(WiFi.RSSI());
   } else {
-    Serial.println(F("[WiFi] Non connecté après WiFiManager."));
+    Serial.println(F("[WiFi] Toujours pas connecté après WiFiManager."));
   }
+}
+
+// Retry auto si on perd le Wi-Fi
+void retryWiFiIfNeeded() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  unsigned long now = millis();
+  if (now - lastWifiRetryMs < WIFI_RETRY_INTERVAL_MS) return;
+  lastWifiRetryMs = now;
+
+  Serial.println(F("[WiFi] Perdu -> tentative automatique..."));
+  WiFi.disconnect(true, true);
+  delay(200);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();
 }
 
 // =============================
@@ -227,14 +270,9 @@ int compareSemver(const String& a, const String& b) {
 }
 
 // =============================
-// OTA via firmware.json (UNIQUEMENT SI maintenanceMode == true)
+// OTA via firmware.json
 // =============================
 void checkForOTAUpdate() {
-  if (!maintenanceMode) {
-    Serial.println(F("[OTA] Maintenance désactivée → OTA ignoré."));
-    return;
-  }
-
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println(F("[OTA] Wi-Fi non connecté, skip."));
     return;
@@ -300,6 +338,7 @@ void checkForOTAUpdate() {
   Serial.print(F("[OTA] Version locale   = "));
   Serial.println(FIRMWARE_VERSION);
 
+  // Comparaison sémantique : on n'update que si remote > locale
   int cmp = compareSemver(String(FIRMWARE_VERSION), remoteVersion);
   if (cmp >= 0) {
     Serial.println(F("[OTA] Firmware déjà à jour ou plus récent, pas d'update."));
@@ -374,15 +413,17 @@ void checkForOTAUpdate() {
 // RÉCUPÉRATION CONFIG SERVEUR
 // =============================
 void applyDefaultConfig() {
-  measureIntervalMs = DEFAULT_MEASURE_INTERVAL_S * 1000UL;
-  maintenanceMode   = true; // par défaut → pas de deep sleep, OTA autorisé
+  // Par défaut : maintenance ON, 10 s
+  maintenanceMode   = true;
+  testMode20s       = false;
+  measureIntervalMs = MAINTENANCE_INTERVAL_MS;
 }
 
 void checkConfigUpdate() {
-  applyDefaultConfig(); // valeurs de base
+  applyDefaultConfig(); // valeurs de base, au cas où
 
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(F("[CFG] Wi-Fi non connecté, config par défaut."));
+    Serial.println(F("[CFG] Wi-Fi non connecté, config par défaut (maintenance 10 s)."));
     return;
   }
 
@@ -434,27 +475,46 @@ void checkConfigUpdate() {
     return;
   }
 
-  // measure_interval_s (intervalle de mesure en secondes)
+  // Champs attendus : measure_interval_s, maintenance, test_20s
   unsigned long intervalS = doc["measure_interval_s"] | DEFAULT_MEASURE_INTERVAL_S;
-  if (intervalS == 0) intervalS = DEFAULT_MEASURE_INTERVAL_S;
+  bool maintJson          = doc["maintenance"] | true;
+  bool testJson           = doc["test_20s"]    | false;
 
-  // maintenance (booléen)
-  maintenanceMode = doc["maintenance"] | true;
-
-  // Logique :
-  // - maintenance = true  → intervalle FORCÉ à 10 s
-  // - maintenance = false → intervalle = measure_interval_s (deep sleep normal ou mode test 20 s)
-  if (maintenanceMode) {
-    measureIntervalMs = 10UL * 1000UL;  // 10 secondes
-  } else {
-    measureIntervalMs = intervalS * 1000UL;
+  // Conflit éventuel : les deux à true
+  if (maintJson && testJson) {
+    Serial.println(F("[CFG] ATTENTION: maintenance=true & test_20s=true -> priorité à maintenance."));
+    testJson = false;
   }
 
-  Serial.print(F("[CFG] measure_interval_s (reçu) = "));
-  Serial.println(intervalS);
-  Serial.print(F("[CFG] maintenance                = "));
+  if (maintJson) {
+    // Mode maintenance : 10 s, pas de deep-sleep, OTA actif
+    maintenanceMode   = true;
+    testMode20s       = false;
+    measureIntervalMs = MAINTENANCE_INTERVAL_MS;
+    Serial.println(F("[CFG] Mode = MAINTENANCE (mesure toutes les 10 s, sans deep-sleep)."));
+  } else if (testJson) {
+    // Mode test deep-sleep 20 s
+    maintenanceMode   = false;
+    testMode20s       = true;
+    measureIntervalMs = TEST_INTERVAL_MS;
+    Serial.println(F("[CFG] Mode = TEST deep-sleep (réveil toutes les 20 s)."));
+  } else {
+    // Mode deep-sleep normal, basé sur measure_interval_s
+    maintenanceMode = false;
+    testMode20s     = false;
+
+    if (intervalS == 0) intervalS = DEFAULT_MEASURE_INTERVAL_S;
+    measureIntervalMs = intervalS * 1000UL;
+
+    Serial.print(F("[CFG] Mode = DEEP-SLEEP normal, measure_interval_s = "));
+    Serial.println(intervalS);
+  }
+
+  Serial.print(F("[CFG] maintenance       = "));
   Serial.println(maintenanceMode ? F("true") : F("false"));
-  Serial.print(F("[CFG] measureIntervalMs appliqué = "));
+  Serial.print(F("[CFG] test_20s          = "));
+  Serial.println(testMode20s ? F("true") : F("false"));
+  Serial.print(F("[CFG] measureIntervalMs = "));
   Serial.println(measureIntervalMs);
 }
 
@@ -467,6 +527,7 @@ void maybeDeepSleep() {
     return;
   }
 
+  // Mode normal ou test : on dort pour la durée de l’intervalle de mesure
   uint64_t sleepUs = (uint64_t)measureIntervalMs * 1000ULL;
   Serial.print(F("[SLEEP] Deep sleep pendant (ms) = "));
   Serial.println(measureIntervalMs);
@@ -485,7 +546,7 @@ void setup() {
   delay(500);
 
   Serial.println();
-  Serial.println(F("=== Barrique ESP32-C3 — WiFiManager + OTA (maintenance) + Config + DeepSleep ==="));
+  Serial.println(F("=== Barrique ESP32-C3 v1.1.0 — WiFiManager + OTA (maintenance) + Config + DeepSleep ==="));
 
   deviceId = makeDeviceId9Digits();
   Serial.print(F("[ID] Device ID = "));
@@ -496,21 +557,29 @@ void setup() {
   // Wi-Fi
   setupWiFi();
 
-  // Config serveur (measure_interval_s, maintenance)
+  // Config serveur (measure_interval_s, maintenance, test_20s)
   checkConfigUpdate();
 
-  // Vérif OTA au démarrage UNIQUEMENT si maintenanceMode = true
-  checkForOTAUpdate();
+  // OTA au démarrage UNIQUEMENT en mode maintenance
+  if (maintenanceMode) {
+    checkForOTAUpdate();
+  } else {
+    Serial.println(F("[OTA] Mode deep-sleep ou test -> OTA ignoré au démarrage."));
+  }
 
-  // Démarre le timer
+  // Démarre les timers à maintenant
   unsigned long now = millis();
-  lastMeasureMs = now;
+  lastMeasureMs   = now;
+  lastWifiRetryMs = now;
 }
 
 // =============================
 // LOOP
 // =============================
 void loop() {
+  // Retente Wi-Fi si perdu (quand on est réveillé)
+  retryWiFiIfNeeded();
+
   unsigned long now = millis();
 
   if (now - lastMeasureMs >= measureIntervalMs) {
@@ -538,10 +607,14 @@ void loop() {
     // 5) Récupérer éventuellement une nouvelle config
     checkConfigUpdate();
 
-    // 6) Vérifier OTA UNIQUEMENT en maintenance
-    checkForOTAUpdate();
+    // 6) OTA UNIQUEMENT en mode maintenance
+    if (maintenanceMode) {
+      checkForOTAUpdate();
+    } else {
+      Serial.println(F("[OTA] Mode deep-sleep/test -> pas d'OTA."));
+    }
 
-    // 7) Deep sleep éventuel (si maintenance = false)
+    // 7) Deep sleep éventuel (normal ou test)
     maybeDeepSleep();
   }
 
