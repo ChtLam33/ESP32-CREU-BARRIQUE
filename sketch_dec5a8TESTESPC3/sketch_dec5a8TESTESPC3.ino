@@ -1,5 +1,5 @@
 /*
- * Firmware ESP32-C3 — Capteur barrique — v1.0.7
+ * Firmware ESP32-C3 — Capteur barrique — v1.0.8
  *
  * - WiFiManager (pas de SSID/MdP en dur)
  * - Lecture ADC (capteur niveau barrique)
@@ -38,7 +38,7 @@ const char* OTA_JSON_PATH = "/barriques/firmware/firmware.json";
 // =============================
 // VERSION FIRMWARE
 // =============================
-const char* FIRMWARE_VERSION = "1.0.7";
+const char* FIRMWARE_VERSION = "1.0.8";
 
 // =============================
 // HARDWARE & ADC
