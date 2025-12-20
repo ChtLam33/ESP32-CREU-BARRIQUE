@@ -1,22 +1,6 @@
 /*
- * Firmware ESP32-C3 — Capteur barrique — v1.1.2
- *
- * - WiFiManager (pas de SSID/MdP en dur)
- * - Lecture ADC (capteur niveau barrique)
- * - Envoi JSON HTTPS vers api_post.php
- * - Récupération config serveur (measure_interval_s, maintenance, test_mode)
- * - OTA HTTP via firmware.json (UNIQUEMENT en mode maintenance)
- * - 3 modes :
- *     • maintenance      : pas de deep-sleep, mesure toutes les 10 s, OTA ON
- *     • test deep-sleep  : deep-sleep 20 s, OTA OFF
- *     • deep-sleep normal: deep-sleep measure_interval_s, OTA OFF
- *
- * Comportement deep-sleep (normal & test) :
- *   - À chaque réveil / démarrage :
- *       1) Wi-Fi
- *       2) 1 mesure + POST
- *       3) Récup config serveur
- *       4) "Bonne nuit..." puis deep-sleep
+ * Firmware ESP32-C3 — Capteur barrique — v1.1.3
+ * (fix compile ESP32-C3: pas de adc1_channel_t)
  */
 
 #include <Arduino.h>
@@ -42,14 +26,20 @@ const char* OTA_JSON_PATH = "/barriques/firmware/firmware.json";
 // =============================
 // VERSION FIRMWARE
 // =============================
-const char* FIRMWARE_VERSION = "1.1.2";
+const char* FIRMWARE_VERSION = "1.1.3";
 
 // =============================
 // HARDWARE & ADC
 // =============================
-const int   PIN_CAPTEUR = 1;
-const float VREF        = 3.3;
+const int   PIN_CAPTEUR = 1;   // niveau
+const int   PIN_BAT     = 0;   // batterie (point milieu diviseur)
+const float VREF        = 3.3f;
 const int   ADC_MAX     = 4095;
+
+// Diviseur batterie : BAT+ -> R_TOP -> (GPIO0) -> R_BOT -> GND
+// Ici : R_TOP = 100k, R_BOT = 100k => VBAT = VGPIO * 2
+const float R_TOP_OHMS = 100000.0f;
+const float R_BOT_OHMS = 100000.0f;
 
 // =============================
 // CONFIG MESURE / MODES
@@ -94,7 +84,23 @@ uint16_t readAdcAveraged(int pin, int samples = 40) {
     sum += analogRead(pin);
     delay(3);
   }
-  return sum / samples;
+  return (uint16_t)(sum / samples);
+}
+
+// =============================
+// BATTERIE (mV)
+// =============================
+uint16_t readBatteryMv(int samples = 40) {
+  uint16_t raw = readAdcAveraged(PIN_BAT, samples);
+
+  float v_mid = (raw * VREF) / (float)ADC_MAX; // V au GPIO
+  float ratio = (R_TOP_OHMS + R_BOT_OHMS) / R_BOT_OHMS;
+  float v_bat = v_mid * ratio; // VBAT estimée
+
+  if (v_bat < 0.0f) v_bat = 0.0f;
+  if (v_bat > 6.0f) v_bat = 6.0f;
+
+  return (uint16_t)roundf(v_bat * 1000.0f);
 }
 
 // =============================
@@ -117,17 +123,17 @@ time_t getTimestamp() {
 }
 
 // =============================
-// WiFi via WiFiManager (ancienne version qui marchait)
+// WiFi via WiFiManager (ancienne version)
+// + Redirection "dans le portail" (best effort)
 // =============================
 void setupWiFi() {
   Serial.println(F("\n[WiFi] Initialisation..."));
   WiFi.mode(WIFI_STA);
   WiFi.persistent(true);
 
-  // Tentative de reconnexion avec les identifiants déjà connus
   WiFi.begin();
   int tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 60) { // ~30s
+  while (WiFi.status() != WL_CONNECTED && tries < 60) {
     delay(500);
     Serial.print('.');
     tries++;
@@ -140,7 +146,21 @@ void setupWiFi() {
 
     WiFiManager wm;
     wm.setDebugOutput(false);
-    wm.setConfigPortalTimeout(180); // 3 min max
+    wm.setConfigPortalTimeout(180);
+
+    const char* headScript =
+      "<script>"
+      "setTimeout(function(){"
+      "try{"
+      "var t=(document.body&&document.body.innerText)?document.body.innerText:'';"
+      "t=t.toLowerCase();"
+      "if(t.includes('connected')||t.includes('connecte')||t.includes('successful')||t.includes('success')){"
+      "window.location.href='https://prod.lamothe-despujols.com/';"
+      "}"
+      "}catch(e){}"
+      "},1800);"
+      "</script>";
+    wm.setCustomHeadElement(headScript);
 
     String apName = "Barrique-" + deviceId;
     Serial.print(F("[WiFi] AP config = "));
@@ -163,7 +183,6 @@ void setupWiFi() {
   }
 }
 
-// Retry auto (utilisé en maintenance uniquement)
 void retryWiFiIfNeeded() {
   if (WiFi.status() == WL_CONNECTED) return;
 
@@ -234,16 +253,10 @@ void parseSemver(const String& v, int &maj, int &min, int &pat) {
   int p1 = v.indexOf('.');
   int p2 = (p1 >= 0) ? v.indexOf('.', p1 + 1) : -1;
 
-  if (p1 < 0) {
-    maj = v.toInt();
-    return;
-  }
+  if (p1 < 0) { maj = v.toInt(); return; }
   maj = v.substring(0, p1).toInt();
 
-  if (p2 < 0) {
-    min = v.substring(p1 + 1).toInt();
-    return;
-  }
+  if (p2 < 0) { min = v.substring(p1 + 1).toInt(); return; }
   min = v.substring(p1 + 1, p2).toInt();
   pat = v.substring(p2 + 1).toInt();
 }
@@ -287,9 +300,7 @@ void checkForOTAUpdate() {
     String line = client.readStringUntil('\n');
     if (line == "\r") break;
   }
-  while (client.available()) {
-    payload += client.readString();
-  }
+  while (client.available()) payload += client.readString();
   client.stop();
 
   int start = payload.indexOf('{');
@@ -434,9 +445,7 @@ void checkConfigUpdate() {
     String line = client.readStringUntil('\n');
     if (line == "\r") break;
   }
-  while (client.available()) {
-    payload += client.readString();
-  }
+  while (client.available()) payload += client.readString();
   client.stop();
 
   int start = payload.indexOf('{');
@@ -459,8 +468,7 @@ void checkConfigUpdate() {
     return;
   }
 
-  unsigned long intervalS =
-    doc["measure_interval_s"] | DEFAULT_MEASURE_INTERVAL_S;
+  unsigned long intervalS = doc["measure_interval_s"] | DEFAULT_MEASURE_INTERVAL_S;
   if (intervalS == 0) intervalS = DEFAULT_MEASURE_INTERVAL_S;
   measureIntervalMs = intervalS * 1000UL;
 
@@ -479,7 +487,7 @@ void checkConfigUpdate() {
 // DEEP SLEEP helper
 // =============================
 void goToDeepSleep(const char* modeLabel, unsigned long intervalMs) {
-  if (intervalMs < 5000UL) intervalMs = 5000UL; // sécurité
+  if (intervalMs < 5000UL) intervalMs = 5000UL;
 
   Serial.print(F("[SLEEP] Mode = "));
   Serial.println(modeLabel ? modeLabel : "");
@@ -498,15 +506,18 @@ void goToDeepSleep(const char* modeLabel, unsigned long intervalMs) {
 // =============================
 void doOneMeasurement() {
   uint16_t raw = readAdcAveraged(PIN_CAPTEUR);
-  float v = (raw * VREF) / ADC_MAX;
+  float v = (raw * VREF) / (float)ADC_MAX;
 
   Serial.print(F("[CAPTEUR] RAW = "));
   Serial.print(raw);
   Serial.print(F("   V ≈ "));
   Serial.println(v, 3);
 
+  uint16_t batteryMv = readBatteryMv();
+  Serial.print(F("[BAT] battery_mv = "));
+  Serial.println(batteryMv);
+
   int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
-  uint16_t batteryMv = 0; // à câbler plus tard
   time_t ts = getTimestamp();
 
   postMeasurement(raw, rssi, batteryMv, ts);
@@ -520,21 +531,21 @@ void setup() {
   delay(500);
 
   Serial.println();
-  Serial.println(F("=== Barrique ESP32-C3 v1.1.0 — WiFiManager + OTA + Config + DeepSleep ==="));
+  Serial.print(F("=== Barrique ESP32-C3 v"));
+  Serial.print(FIRMWARE_VERSION);
+  Serial.println(F(" — WiFiManager + OTA + Config + DeepSleep + BAT ==="));
 
   deviceId = makeDeviceId9Digits();
   Serial.print(F("[ID] Device ID = "));
   Serial.println(deviceId);
 
   analogReadResolution(12);
+  analogSetAttenuation(ADC_11db); // suffit et compile sur ton core
 
-  // 1) Wi-Fi
   setupWiFi();
 
-  // 2) Première mesure immédiatement (si possible)
   doOneMeasurement();
 
-  // 3) Récup config serveur pour savoir quel mode on utilise
   checkConfigUpdate();
 
   Serial.print(F("[MODE] maintenance = "));
@@ -544,17 +555,12 @@ void setup() {
   Serial.print(F("[MODE] measureIntervalMs = "));
   Serial.println(measureIntervalMs);
 
-  // 4) Décision de mode
   if (!maintenanceMode) {
-    // MODE DEEP-SLEEP (normal ou test) → pas d'OTA
     unsigned long intervalMs = testMode ? TEST_INTERVAL_MS : measureIntervalMs;
     const char* label = testMode ? "test 20s" : "normal";
     goToDeepSleep(label, intervalMs);
-    // ne revient jamais
   }
 
-  // Si on arrive ici → mode maintenance
-  // OTA autorisé uniquement ici
   checkForOTAUpdate();
 
   unsigned long now = millis();
@@ -567,7 +573,6 @@ void setup() {
 // =============================
 void loop() {
   if (!maintenanceMode) {
-    // Sécurité : si la config a changé à chaud, on repasse en deep-sleep
     unsigned long intervalMs = testMode ? TEST_INTERVAL_MS : measureIntervalMs;
     const char* label = testMode ? "test 20s" : "normal";
     goToDeepSleep(label, intervalMs);
@@ -580,8 +585,8 @@ void loop() {
     lastMeasureMs = now;
 
     doOneMeasurement();
-    checkConfigUpdate();   // peut changer maintenance/test/interval
-    checkForOTAUpdate();   // OTA seulement en maintenance
+    checkConfigUpdate();
+    checkForOTAUpdate();
   }
 
   delay(50);
