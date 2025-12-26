@@ -1,6 +1,8 @@
 /*
- * Firmware ESP32-C3 — Capteur barrique — v1.1.3
- * (fix compile ESP32-C3: pas de adc1_channel_t)
+ * Firmware ESP32-C3 — Capteur barrique — v1.1.4
+ * - Suppression de la redirection/JS dans le portail WiFiManager (source de bugs)
+ * - Connexion Wi-Fi plus robuste : tentative rapide de reconnexion, puis portail si échec
+ * - Le portail n'empêche plus le fonctionnement normal (timeout + retour propre)
  */
 
 #include <Arduino.h>
@@ -26,7 +28,7 @@ const char* OTA_JSON_PATH = "/barriques/firmware/firmware.json";
 // =============================
 // VERSION FIRMWARE
 // =============================
-const char* FIRMWARE_VERSION = "1.1.3";
+const char* FIRMWARE_VERSION = "1.1.4";
 
 // =============================
 // HARDWARE & ADC
@@ -123,51 +125,57 @@ time_t getTimestamp() {
 }
 
 // =============================
-// WiFi via WiFiManager (ancienne version)
-// + Redirection "dans le portail" (best effort)
+// WiFi (v1.1.4)
+// - plus de redirection/JS WiFiManager
+// - reconnexion rapide, puis portail si besoin
 // =============================
-void setupWiFi() {
-  Serial.println(F("\n[WiFi] Initialisation..."));
+static bool tryQuickReconnect(unsigned long timeoutMs) {
+  Serial.println(F("[WiFi] Tentative reconnexion rapide..."));
   WiFi.mode(WIFI_STA);
   WiFi.persistent(true);
 
+  // si les identifiants sont déjà en NVS, WiFi.begin() sans args suffit
   WiFi.begin();
-  int tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 60) {
-    delay(500);
-    Serial.print('.');
-    tries++;
-  }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(F("\n[WiFi] Reconnexion OK sans portail."));
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
+    delay(250);
+    Serial.print('.');
+  }
+  Serial.println();
+
+  return (WiFi.status() == WL_CONNECTED);
+}
+
+void setupWiFi() {
+  Serial.println(F("\n[WiFi] Initialisation..."));
+
+  // 1) Reco rapide (ne bloque pas 30 secondes inutilement)
+  if (tryQuickReconnect(8000UL)) {
+    Serial.println(F("[WiFi] Reconnexion OK (sans portail)."));
   } else {
-    Serial.println(F("\n[WiFi] Échec de reconnexion automatique, WiFiManager..."));
+    Serial.println(F("[WiFi] Reconnexion échouée -> WiFiManager (portail)."));
 
     WiFiManager wm;
     wm.setDebugOutput(false);
-    wm.setConfigPortalTimeout(180);
 
-    const char* headScript =
-      "<script>"
-      "setTimeout(function(){"
-      "try{"
-      "var t=(document.body&&document.body.innerText)?document.body.innerText:'';"
-      "t=t.toLowerCase();"
-      "if(t.includes('connected')||t.includes('connecte')||t.includes('successful')||t.includes('success')){"
-      "window.location.href='https://prod.lamothe-despujols.com/';"
-      "}"
-      "}catch(e){}"
-      "},1800);"
-      "</script>";
-    wm.setCustomHeadElement(headScript);
+    // IMPORTANT : timeout court pour ne pas bloquer le fonctionnement normal
+    // (le portail se coupe tout seul)
+    wm.setConfigPortalTimeout(180);   // 3 minutes
+    wm.setConnectTimeout(20);         // tentative de connexion AP->STA max 20 s
+    wm.setWiFiAutoReconnect(true);
 
     String apName = "Barrique-" + deviceId;
     Serial.print(F("[WiFi] AP config = "));
     Serial.println(apName);
 
-    if (!wm.autoConnect(apName.c_str())) {
-      Serial.println(F("[WiFi] WiFiManager échec ou timeout -> pas de Wi-Fi."));
+    // autoConnect : démarre AP+portail, essaie de se connecter, puis rend la main
+    bool ok = wm.autoConnect(apName.c_str());
+
+    if (!ok) {
+      Serial.println(F("[WiFi] WiFiManager timeout/échec -> pas de Wi-Fi (continue)."));
+      // On laisse WiFi en STA pour permettre retries plus tard
+      WiFi.mode(WIFI_STA);
     }
   }
 
@@ -179,7 +187,7 @@ void setupWiFi() {
     Serial.print(F("       RSSI = "));
     Serial.println(WiFi.RSSI());
   } else {
-    Serial.println(F("[WiFi] Toujours pas connecté après WiFiManager."));
+    Serial.println(F("[WiFi] Toujours pas connecté."));
   }
 }
 
@@ -540,7 +548,7 @@ void setup() {
   Serial.println(deviceId);
 
   analogReadResolution(12);
-  analogSetAttenuation(ADC_11db); // suffit et compile sur ton core
+  analogSetAttenuation(ADC_11db);
 
   setupWiFi();
 
