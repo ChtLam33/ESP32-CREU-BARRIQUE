@@ -1,6 +1,13 @@
 /*
- * Firmware ESP32-C3 — Capteur barrique — v2.0.0
- * Refonte (assistee par Claude Code) suite a l'incident de vidage de batterie :
+ * Firmware ESP32-C3 — Capteur barrique — v2.0.1
+ * v2.0.1 : le message envoye au serveur inclut desormais "sleep_s", la duree
+ *   (en secondes) de deep sleep que ce cycle va effectivement utiliser. Permet
+ *   au dashboard de calculer une date de prochain reveil fiable par capteur,
+ *   meme si le reglage serveur a change depuis le dernier reveil de CE capteur
+ *   (chaque capteur ne connait son propre intervalle qu'a son propre reveil).
+ *
+ * v2.0.0 : Refonte (assistee par Claude Code) suite a l'incident de vidage de
+ * batterie :
  * - Suppression du mode maintenance : en cas d'echec reseau/config, le capteur
  *   repart dormir avec l'intervalle par defaut plutot que de rester eveille
  *   indefiniment (c'etait la cause racine de l'incident).
@@ -37,7 +44,7 @@ const char* OTA_JSON_PATH = "/barriques/firmware/firmware.json";
 // =============================
 // VERSION FIRMWARE
 // =============================
-const char* FIRMWARE_VERSION = "2.0.0";
+const char* FIRMWARE_VERSION = "2.0.1";
 
 // =============================
 // HARDWARE & ADC
@@ -248,6 +255,7 @@ bool postMeasurement(uint16_t raw, int rssi, uint16_t batteryMv, time_t ts,
   payload += "\"rssi\":" + String(rssi) + ",";
   payload += "\"battery_mv\":" + String(batteryMv) + ",";
   payload += "\"ts\":" + String((unsigned long)ts) + ",";
+  payload += "\"sleep_s\":" + String(measureIntervalMs / 1000UL) + ",";
   payload += "\"wifi_ok\":" + String(wifiOk ? "true" : "false") + ",";
   payload += "\"ota_ok\":" + String(otaOk ? "true" : "false") + ",";
   payload += "\"config_ok\":" + String(configOk ? "true" : "false");
