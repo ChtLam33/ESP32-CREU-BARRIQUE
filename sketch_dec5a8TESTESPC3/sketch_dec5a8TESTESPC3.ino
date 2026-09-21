@@ -1,5 +1,22 @@
 /*
- * Firmware ESP32-C3 — Capteur barrique — v2.0.1
+ * Firmware ESP32-C3 — Capteur barrique — v2.1.0
+ * v2.1.0 : reprise des 3 correctifs valides cote cuves (firmware v1.3.1,
+ *   deploye le 21/09/2026) :
+ * - CLE API : premiere inscription automatique aupres de /barriques/register.php
+ *   avec un secret partage grave dans le firmware (secrets.h, non commite),
+ *   cle recue stockee en NVS (Preferences "barrique") et reutilisee a
+ *   chaque reveil - envoyee dans l'en-tete X-Api-Key de chaque requete.
+ * - CERTIFICAT HTTPS : les connexions verifient desormais le certificat
+ *   du serveur (ISRG Root X1) au lieu de client.setInsecure(), avec
+ *   synchronisation NTP prealable. IMPORTANT : si la synchro NTP ou la
+ *   validation echoue, repli automatique en mode non verifie - priorite
+ *   absolue a ne jamais perdre la capacite de recevoir un correctif OTA
+ *   a distance (capteurs alimentes par pile, deep sleep 7 jours : un
+ *   capteur bloque coute une semaine entiere avant la prochaine chance).
+ * - DELAI WI-FI : delay(300) ajoute juste apres WiFi.mode(WIFI_STA), avant
+ *   toute tentative de connexion - confirme efficace cote cuves contre un
+ *   rejet rapide au boot ("wifi:Association refused too many times").
+ *
  * v2.0.1 : le message envoye au serveur inclut desormais "sleep_s", la duree
  *   (en secondes) de deep sleep que ce cycle va effectivement utiliser. Permet
  *   au dashboard de calculer une date de prochain reveil fiable par capteur,
@@ -30,6 +47,7 @@
 #include <time.h>
 #include <esp_sleep.h>
 #include <Preferences.h>
+#include "secrets.h" // definit BARRIQUE_PROVISIONING_SECRET - jamais commite (voir .gitignore + secrets.h.example)
 
 // =============================
 // CONFIG SERVEUR
@@ -40,11 +58,58 @@ const int   SERVER_PORT   = 443;
 const char* API_URL       = "https://prod.lamothe-despujols.com/barriques/api_post.php";
 const char* CONFIG_PATH   = "/barriques/get_config.php";
 const char* OTA_JSON_PATH = "/barriques/firmware/firmware.json";
+const char* REGISTER_PATH = "/barriques/register.php";
 
 // =============================
 // VERSION FIRMWARE
 // =============================
-const char* FIRMWARE_VERSION = "2.0.1";
+const char* FIRMWARE_VERSION = "2.1.0";
+
+// =============================
+// CLE API (obtenue une fois via REGISTER_PATH, puis stockee en NVS)
+// =============================
+String apiKey = ""; // vide tant que non inscrit
+
+// =============================
+// Certificat racine (Let's Encrypt ISRG Root X1, valide jusqu'en 2035)
+// Meme certificat que le firmware cuve, verifie empiriquement le
+// 20/09/2026 contre la chaine reelle servie par le serveur.
+// =============================
+const char* ISRG_ROOT_X1 = R"CERT(-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+)CERT";
+
+// Etat NTP (voir syncTimeNTP() / connectSecure())
+bool timeIsSynced = false;
 
 // =============================
 // HARDWARE & ADC
@@ -113,22 +178,52 @@ uint16_t readBatteryMv(int samples = 40) {
 }
 
 // =============================
-// NTP
+// NTP + CONNEXION HTTPS AVEC REPLI
 // =============================
-time_t getTimestamp() {
-  static bool configured = false;
 
-  if (!configured) {
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-    configured = true;
-  }
+// La validation de certificat exige une horloge a peu pres juste (sinon
+// le certificat parait "pas encore valide"/"expire"). Tentative courte
+// (10s max) - si ca echoue, timeIsSynced reste false et connectSecure()
+// se rabat sur le mode non verifie (voir plus bas). Appelee une seule
+// fois par reveil, dans setupWiFi().
+bool syncTimeNTP() {
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
-  for (int i = 0; i < 10; i++) {
-    time_t now = time(nullptr);
-    if (now > 1700000000) return now;
+  time_t now = time(nullptr);
+  unsigned long start = millis();
+  const unsigned long NTP_TIMEOUT_MS = 10000UL;
+  const time_t SANE_EPOCH_MIN = 1700000000; // ~nov. 2023, largement avant toute utilisation reelle
+
+  while (now < SANE_EPOCH_MIN && millis() - start < NTP_TIMEOUT_MS) {
     delay(300);
+    now = time(nullptr);
   }
-  return 0;
+
+  return now >= SANE_EPOCH_MIN;
+}
+
+time_t getTimestamp() {
+  return timeIsSynced ? time(nullptr) : 0;
+}
+
+// Etablit une connexion HTTPS raw-socket vers le serveur. Verifie le
+// certificat si l'heure est synchronisee ; sinon (ou si la tentative
+// verifiee echoue), se replie automatiquement sur un mode non verifie
+// plutot que de rester muet - priorite absolue a ne jamais perdre la
+// capacite d'envoyer des mesures ou de recevoir un correctif OTA.
+bool connectSecure(WiFiClientSecure &client) {
+  if (timeIsSynced) {
+    client.setCACert(ISRG_ROOT_X1);
+    if (client.connect(SERVER_HOST, SERVER_PORT)) {
+      return true;
+    }
+    client.stop();
+    Serial.println(F("[TLS] Connexion verifiee (certificat) echouee, repli en mode non verifie."));
+  } else {
+    Serial.println(F("[TLS] Heure non synchronisee (NTP), connexion en mode non verifie."));
+  }
+  client.setInsecure();
+  return client.connect(SERVER_HOST, SERVER_PORT);
 }
 
 // =============================
@@ -152,11 +247,97 @@ void markProvisioned() {
 }
 
 // =============================
+// Cle API (memoire permanente, meme namespace NVS que isProvisioned())
+// =============================
+String loadApiKey() {
+  Preferences prefs;
+  prefs.begin("barrique", true); // lecture seule
+  String key = prefs.getString("api_key", "");
+  prefs.end();
+  return key;
+}
+
+void saveApiKey(const String& key) {
+  Preferences prefs;
+  prefs.begin("barrique", false);
+  prefs.putString("api_key", key);
+  prefs.end();
+}
+
+// Appelee uniquement si aucune cle n'est encore en NVS (voir setup()).
+// Envoie le secret partage de l'installation ; si accepte, stocke la
+// cle propre a ce capteur en NVS (persistante a travers le deep sleep)
+// pour les prochains reveils - REGISTER_PATH n'est alors plus rappele.
+void registerWithServer() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  Serial.println(F("[REG] Aucune cle API en memoire, inscription aupres du serveur..."));
+
+  String json = String("{\"id\":\"") + deviceId + "\",\"secret\":\"" + BARRIQUE_PROVISIONING_SECRET + "\"}";
+
+  WiFiClientSecure client;
+  if (!connectSecure(client)) {
+    Serial.println(F("[REG] Connexion HTTPS echouee"));
+    return;
+  }
+
+  client.println(String("POST ") + REGISTER_PATH + " HTTP/1.1");
+  client.println(String("Host: ") + SERVER_HOST);
+  client.println("Content-Type: application/json");
+  client.print("Content-Length: ");
+  client.println(json.length());
+  client.println("Connection: close");
+  client.println();
+  client.print(json);
+
+  String payload;
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") break;
+  }
+  while (client.available()) payload += client.readString();
+  client.stop();
+
+  int start = payload.indexOf('{');
+  int end   = payload.lastIndexOf('}');
+  if (start < 0 || end <= start) {
+    Serial.println(F("[REG] Reponse inattendue"));
+    return;
+  }
+
+  String jsonStr = payload.substring(start, end + 1);
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, jsonStr)) {
+    Serial.println(F("[REG] Erreur parsing JSON"));
+    return;
+  }
+
+  const char* receivedKey = doc["api_key"] | "";
+  if (strlen(receivedKey) == 0) {
+    Serial.println(F("[REG] Inscription refusee (secret invalide ?)"));
+    return;
+  }
+
+  apiKey = String(receivedKey);
+  saveApiKey(apiKey);
+  Serial.println(F("[REG] Inscription reussie, cle API obtenue et enregistree."));
+}
+
+// =============================
 // Wi-Fi
 // =============================
 static bool tryQuickReconnect(unsigned long timeoutMs) {
   Serial.println(F("[WiFi] Tentative reconnexion rapide..."));
   WiFi.mode(WIFI_STA);
+
+  // Delai pour laisser la puce radio finir de s'initialiser/se stabiliser
+  // juste apres WiFi.mode(), avant de tenter une connexion - confirme
+  // efficace cote cuves (firmware v1.3.1) contre un rejet rapide au boot
+  // ("wifi:Association refused too many times, max allowed 1"). Encore
+  // plus utile ici : un echec de reconnexion coute une semaine entiere
+  // avant le prochain reveil.
+  delay(300);
+
   WiFi.persistent(true);
 
   // si les identifiants sont deja en NVS, WiFi.begin() sans args suffit
@@ -202,6 +383,8 @@ void setupWiFi() {
     Serial.print(F("[WiFi] AP config = "));
     Serial.println(apName);
 
+    delay(300); // meme delai de stabilisation radio qu'avant tryQuickReconnect()
+
     // autoConnect : demarre AP+portail, essaie de se connecter, puis rend la main
     bool ok = wm.autoConnect(apName.c_str());
 
@@ -219,6 +402,11 @@ void setupWiFi() {
     Serial.println(WiFi.localIP());
     Serial.print(F("       RSSI = "));
     Serial.println(WiFi.RSSI());
+
+    timeIsSynced = syncTimeNTP();
+    Serial.println(timeIsSynced
+      ? F("[TLS] Heure synchronisee (NTP) - connexions HTTPS verifiees.")
+      : F("[TLS] Echec synchro NTP - connexions HTTPS en mode non verifie pour ce reveil."));
   } else {
     Serial.println(F("[WiFi] Toujours pas connecte."));
   }
@@ -235,7 +423,12 @@ bool postMeasurement(uint16_t raw, int rssi, uint16_t batteryMv, time_t ts,
   }
 
   WiFiClientSecure client;
-  client.setInsecure();
+  bool verified = timeIsSynced;
+  if (verified) {
+    client.setCACert(ISRG_ROOT_X1);
+  } else {
+    client.setInsecure();
+  }
   HTTPClient https;
 
   Serial.print(F("[HTTP] POST -> "));
@@ -247,6 +440,9 @@ bool postMeasurement(uint16_t raw, int rssi, uint16_t batteryMv, time_t ts,
   }
 
   https.addHeader("Content-Type", "application/json");
+  if (apiKey.length() > 0) {
+    https.addHeader("X-Api-Key", apiKey);
+  }
 
   String payload = "{";
   payload += "\"id\":\"" + deviceId + "\",";
@@ -265,6 +461,23 @@ bool postMeasurement(uint16_t raw, int rssi, uint16_t batteryMv, time_t ts,
   Serial.println(payload);
 
   int code = https.POST(payload);
+
+  if (code <= 0 && verified) {
+    Serial.println(F("[HTTP] Echec en mode verifie, nouvelle tentative en mode non verifie..."));
+    https.end();
+    client.stop();
+    client.setInsecure();
+    if (!https.begin(client, API_URL)) {
+      Serial.println(F("[HTTP] begin() ECHEC (repli)"));
+      return false;
+    }
+    https.addHeader("Content-Type", "application/json");
+    if (apiKey.length() > 0) {
+      https.addHeader("X-Api-Key", apiKey);
+    }
+    code = https.POST(payload);
+  }
+
   Serial.print(F("[HTTP] Code = "));
   Serial.println(code);
 
@@ -318,9 +531,7 @@ bool checkForOTAUpdate() {
   Serial.println(F("\n[OTA] Verification de mise a jour..."));
 
   WiFiClientSecure client;
-  client.setInsecure();
-
-  if (!client.connect(SERVER_HOST, SERVER_PORT)) {
+  if (!connectSecure(client)) {
     Serial.println(F("[OTA] Connexion HTTPS echouee (firmware.json)"));
     return false;
   }
@@ -384,7 +595,12 @@ bool checkForOTAUpdate() {
 
   HTTPClient https;
   WiFiClientSecure fwClient;
-  fwClient.setInsecure();
+  bool fwVerified = timeIsSynced;
+  if (fwVerified) {
+    fwClient.setCACert(ISRG_ROOT_X1);
+  } else {
+    fwClient.setInsecure();
+  }
 
   if (!https.begin(fwClient, fwUrl)) {
     Serial.println(F("[OTA] https.begin() echoue"));
@@ -392,6 +608,19 @@ bool checkForOTAUpdate() {
   }
 
   int httpCode = https.GET();
+
+  if (httpCode <= 0 && fwVerified) {
+    Serial.println(F("[OTA] Echec en mode verifie, nouvelle tentative en mode non verifie..."));
+    https.end();
+    fwClient.stop();
+    fwClient.setInsecure();
+    if (!https.begin(fwClient, fwUrl)) {
+      Serial.println(F("[OTA] https.begin() echoue (repli)"));
+      return false;
+    }
+    httpCode = https.GET();
+  }
+
   if (httpCode != HTTP_CODE_OK) {
     Serial.print(F("[OTA] Code HTTP inattendu: "));
     Serial.println(httpCode);
@@ -462,14 +691,13 @@ bool checkConfigUpdate() {
   }
 
   WiFiClientSecure client;
-  client.setInsecure();
 
   String url = String(CONFIG_PATH);
 
   Serial.print(F("[CFG] GET "));
   Serial.println(url);
 
-  if (!client.connect(SERVER_HOST, SERVER_PORT)) {
+  if (!connectSecure(client)) {
     Serial.println(F("[CFG] Connexion HTTPS echouee"));
     return false;
   }
@@ -587,6 +815,19 @@ void setup() {
 
   setupWiFi();
   bool wifiOk = (WiFi.status() == WL_CONNECTED);
+
+  // Cle API : chargee depuis la NVS si deja inscrit, sinon inscription
+  // une seule fois aupres du serveur (voir registerWithServer()). Comme
+  // chaque reveil relance setup() depuis zero, ce test/appel se refait
+  // naturellement a chaque reveil tant qu'aucune cle n'a ete obtenue -
+  // sans bloquer l'envoi de la mesure pour autant (accepte sans cle
+  // pendant la transition, voir isValidBarriqueApiKey() cote serveur).
+  apiKey = loadApiKey();
+  if (apiKey.length() == 0) {
+    registerWithServer();
+  } else {
+    Serial.println(F("[REG] Cle API deja enregistree (NVS)."));
+  }
 
   bool otaOk    = checkForOTAUpdate();   // redemarre seul si une mise a jour est appliquee
   bool configOk = checkConfigUpdate();   // ajuste measureIntervalMs, sinon garde le defaut
