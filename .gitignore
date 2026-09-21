@@ -1,3 +1,4 @@
 desktop.ini
 build/
 secrets.h
+bin/arduino-cli
